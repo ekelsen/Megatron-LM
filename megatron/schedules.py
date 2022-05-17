@@ -164,7 +164,7 @@ def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad):
         input_tensor = [input_tensor]
         unwrap_input_tensor_grad = True
 
-   input_tensor = [inp.get() if isinstance(inp, FutureTensor) else inp for inp in input_tensor]
+    input_tensor = [inp.get() if isinstance(inp, FutureTensor) else inp for inp in input_tensor]
     for x in input_tensor:
         if x is not None:
             x.retain_grad()
@@ -218,11 +218,12 @@ def dummy_handler():
 
 
 def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
-                                   optimizer, timers, forward_only):
+                                   optimizer, timers, forward_only, async_comm):
     """Run forward and backward passes with no pipeline parallelism
     (no inter-stage communication).
 
     Returns dictionary with losses."""
+    del async_comm
     assert len(model) == 1
     model = model[0]
 
@@ -251,11 +252,13 @@ def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
 
 
 def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterator, model,
-                                                  optimizer, timers, forward_only):
+                                                  optimizer, timers, forward_only, async_comm):
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
 
     Returns dictionary with losses if the last stage, empty dict otherwise."""
+    if async_comm:
+        print("Warning, async communication relatively untested for interleaved pipelining!")
     input_tensors = [[] for _ in range(len(model))]
     output_tensors = [[] for _ in range(len(model))]
     losses_reduced = []
