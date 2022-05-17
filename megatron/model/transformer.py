@@ -15,6 +15,7 @@
 
 """Transformer."""
 import math
+from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 
@@ -41,6 +42,29 @@ from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
     tensor of the same size. We use the following arguments:
         hyperparameters: transformer hyperparameters
 """
+
+
+class DropPath(MegatronModule):
+    """Drop paths (Stochastic Depth) per sample 
+    (when applied in main path of residual blocks).
+    """
+
+    def __init__(self, drop_prob=0.):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, hidden_state):
+        if self.drop_prob == 0. or not self.training:
+            return hidden_state
+        keep_prob = 1 - self.drop_prob
+        # work with diff dim tensors, not just 2D ConvNets
+        shape = (hidden_state.shape[0],) + (1,) * (hidden_state.ndim - 1)
+        random_tensor = keep_prob + \
+            torch.rand(shape, dtype=hidden_state.dtype, device=hidden_state.device)
+        random_tensor.floor_()  # binarize
+        output = hidden_state.div(keep_prob) * random_tensor
+        return output
+
 
 class ParallelMLP(MegatronModule):
     """MLP.
@@ -93,6 +117,53 @@ class ParallelMLP(MegatronModule):
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
         return output, output_bias
 
+class SwitchMLP(MegatronModule):
+    """
+    Routes input to one of N MLP "experts"
+    """
+    def __init__(self, init_method, output_layer_init_method):
+        super(SwitchMLP, self).__init__()
+        args = get_args()
+        self.router = torch.nn.Linear(args.hidden_size, args.num_experts)
+        self.experts = torch.nn.ModuleList()
+        for i in range(args.num_experts):
+            self.experts.append(ParallelMLP(init_method, output_layer_init_method))
+
+    def forward(self, hidden_states):
+        # hidden_states: [b, s, h]
+        b = hidden_states.size(0)
+        s = hidden_states.size(1)
+        h = hidden_states.size(2)
+        route = self.router(hidden_states)
+        route = torch.nn.functional.softmax(route, dim=2)
+        max_prob, max_ind = torch.max(route, dim=2)
+        max_prob = torch.unsqueeze(max_prob, 2) # [b s 1]
+
+        # TODO (rprenger) TODO this could be made easier to read
+        # Converting [b, s, h] to [b*s, h].
+        # Each vector could be routed differently
+        hidden_states = hidden_states.view(-1, hidden_states.size(2)) # [b*s h]
+        max_prob = max_prob.view(-1, max_prob.size(2)) # [b*s 1]
+        max_ind = max_ind.view(-1) # [b*s]
+
+        output_total = torch.empty_like(hidden_states)
+        output_bias_total = torch.empty_like(hidden_states)
+        #TODO (rprenger) This does each expert in serial, but it could be parallelized
+        
+        for expert_num, expert in enumerate(self.experts):
+            local_indices = (max_ind == expert_num).nonzero()
+            hidden = hidden_states[local_indices,:]
+            output, output_bias = expert(hidden)
+            output_bias = output_bias.expand_as(output)
+            output_total[local_indices,:] = output
+            output_bias_total[local_indices,:] = output_bias
+
+        output_total = output_total*max_prob
+        output_bias_total = output_bias_total*max_prob
+        output_total = output_total.view(b, s, h)
+        output_bias_total = output_bias_total.view(b, s, h)
+
+        return output_total, output_bias_total
 
 class ParallelAttention(MegatronModule):
     """Parallel self-attention layer abstract class.
@@ -406,7 +477,8 @@ class ParallelTransformerLayer(MegatronModule):
 
     def __init__(self, init_method, output_layer_init_method,
                  layer_number, layer_type=LayerType.encoder,
-                 self_attn_mask_type=AttnMaskType.padding):
+                 self_attn_mask_type=AttnMaskType.padding,
+                 drop_path_rate=0.):
         args = get_args()
 
         super(ParallelTransformerLayer, self).__init__()
@@ -434,6 +506,7 @@ class ParallelTransformerLayer(MegatronModule):
             attn_mask_type=self_attn_mask_type)
         self.hidden_dropout = args.hidden_dropout
         self.bias_dropout_fusion = args.bias_dropout_fusion
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
 
         # Layernorm on the attention output
         self.post_attention_layernorm = LayerNorm(
@@ -454,8 +527,17 @@ class ParallelTransformerLayer(MegatronModule):
                 no_persist_layer_norm=args.no_persist_layer_norm)
 
         # MLP
-        self.mlp = ParallelMLP(init_method,
-                               output_layer_init_method)
+        if args.num_experts is not None:
+            self.mlp = SwitchMLP(init_method, output_layer_init_method)
+        else:
+            self.mlp = ParallelMLP(init_method, output_layer_init_method)
+
+        # Set bias+dropout+add fusion grad_enable execution handler.
+        TORCH_MAJOR = int(torch.__version__.split('.')[0])
+        TORCH_MINOR = int(torch.__version__.split('.')[1])
+        use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
+        self.bias_dropout_add_exec_handler = \
+                nullcontext if use_nvfuser else torch.enable_grad
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
@@ -477,25 +559,30 @@ class ParallelTransformerLayer(MegatronModule):
         else:
             residual = hidden_states
 
-        # jit scripting for a nn.module (with dropout) is not
-        # trigerring the fusion kernel. For now, we use two
-        # different nn.functional routines to account for varying
-        # dropout semantics during training and inference phases.
-        if self.bias_dropout_fusion:
-            if self.training:
-                bias_dropout_add_func = bias_dropout_add_fused_train
+        if self.drop_path is None:
+            # jit scripting for a nn.module (with dropout) is not
+            # trigerring the fusion kernel. For now, we use two
+            # different nn.functional routines to account for varying
+            # dropout semantics during training and inference phases.
+            if self.bias_dropout_fusion:
+                if self.training:
+                    bias_dropout_add_func = bias_dropout_add_fused_train
+                else:
+                    bias_dropout_add_func = bias_dropout_add_fused_inference
             else:
-                bias_dropout_add_func = bias_dropout_add_fused_inference
-        else:
-            bias_dropout_add_func = get_bias_dropout_add(self.training)
+                bias_dropout_add_func = get_bias_dropout_add(self.training)
 
-        # re-enable torch grad to enable fused optimization.
-        with torch.enable_grad():
-            layernorm_input = bias_dropout_add_func(
-                attention_output,
-                attention_bias.expand_as(residual),
-                residual,
-                self.hidden_dropout)
+            with self.bias_dropout_add_exec_handler():
+                layernorm_input = bias_dropout_add_func(
+                    attention_output,
+                    attention_bias.expand_as(residual),
+                    residual,
+                    self.hidden_dropout)
+        else:
+            out = torch.nn.functional.dropout(attention_output + attention_bias,
+                                              p=self.hidden_dropout,
+                                              training=self.training)
+            layernorm_input = residual + self.drop_path(out)
 
         # Layer norm post the self attention.
         layernorm_output = self.post_attention_layernorm(layernorm_input)
@@ -511,8 +598,7 @@ class ParallelTransformerLayer(MegatronModule):
             else:
                 residual = layernorm_input
 
-            # re-enable torch grad to enable fused optimization.
-            with torch.enable_grad():
+            with self.bias_dropout_add_exec_handler():
                 layernorm_input = bias_dropout_add_func(
                     attention_output,
                     attention_bias.expand_as(residual),
@@ -531,15 +617,46 @@ class ParallelTransformerLayer(MegatronModule):
         else:
             residual = layernorm_input
 
-        # re-enable torch grad to enable fused optimization.
-        with torch.enable_grad():
-            output = bias_dropout_add_func(
-                mlp_output,
-                mlp_bias.expand_as(residual),
-                residual,
-                self.hidden_dropout)
+        if self.drop_path is None:
+            with self.bias_dropout_add_exec_handler():
+                output = bias_dropout_add_func(
+                    mlp_output,
+                    mlp_bias.expand_as(residual),
+                    residual,
+                    self.hidden_dropout)
+        else:
+            out = torch.nn.functional.dropout(mlp_output + mlp_bias,
+                                              p=self.hidden_dropout,
+                                              training=self.training)
+            output = residual + self.drop_path(out)
 
         return output
+
+
+class NoopTransformerLayer(MegatronModule):
+    """A single 'no-op' transformer layer.
+
+    The sole purpose of this layer is for when a standalone embedding layer
+    is used (i.e., args.standalone_embedding_stage == True). In this case,
+    zero transformer layers are assigned when pipeline rank == 0. Additionally,
+    when virtual pipeline rank >= 1, zero total model parameters are created
+    (virtual rank 0 contains the input embedding). This results in the model's
+    input and output tensors being the same, which causes an error when
+    performing certain memory optimiations on the output tensor (e.g.,
+    deallocating it). Thus, this layer disconnects the input from the output
+    via a clone. Since ranks containing a no-op layer are generally under-
+    utilized (both compute and memory), there's no worry of any performance
+    degredation.
+    """
+
+    def __init__(self, layer_number):
+        super().__init__()
+        self.layer_number = layer_number
+
+    def forward(self, hidden_states, attention_mask,
+                encoder_output=None, enc_dec_attn_mask=None,
+                inference_params=None):
+        return hidden_states.clone()
 
 
 class ParallelTransformer(MegatronModule):
@@ -548,15 +665,19 @@ class ParallelTransformer(MegatronModule):
     def __init__(self, init_method, output_layer_init_method,
                  layer_type=LayerType.encoder,
                  self_attn_mask_type=AttnMaskType.padding,
-                 pre_process=True, post_process=True):
+                 post_layer_norm=True, 
+                 pre_process=True, post_process=True,
+                 drop_path_rate=0.0):
         super(ParallelTransformer, self).__init__()
         args = get_args()
 
         self.bf16 = args.bf16
         self.fp32_residual_connection = args.fp32_residual_connection
+        self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
         self.input_tensor = None
+        self.drop_path_rate = drop_path_rate
 
         # Store activation checkpoiting flag.
         self.activations_checkpoint_method = args.activations_checkpoint_method
@@ -567,6 +688,8 @@ class ParallelTransformer(MegatronModule):
         self.num_layers = mpu.get_num_layers(
             args, args.model_type == ModelType.encoder_and_decoder)
 
+        self.drop_path_rates = [rate.item() for rate in torch.linspace(0, self.drop_path_rate, args.num_layers)]
+
         # Transformer layers.
         def build_layer(layer_number):
             return ParallelTransformerLayer(
@@ -574,7 +697,8 @@ class ParallelTransformer(MegatronModule):
                 output_layer_init_method,
                 layer_number,
                 layer_type=layer_type,
-                self_attn_mask_type=self_attn_mask_type)
+                self_attn_mask_type=self_attn_mask_type,
+                drop_path_rate=self.drop_path_rates[layer_number - 1])
         if args.virtual_pipeline_model_parallel_size is not None:
             assert args.num_layers % args.virtual_pipeline_model_parallel_size == 0, \
                 'num_layers_per_stage must be divisible by ' \
@@ -607,10 +731,22 @@ class ParallelTransformer(MegatronModule):
             else:
                 offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
 
-        self.layers = torch.nn.ModuleList(
-            [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+        if self.num_layers == 0:
+            # When a standalone embedding stage is used (e.g.,
+            # args.standalone_embedding_stage == True), virtual pipeline ranks
+            # on pipeline rank 0 will have zero transformer layers assigned to
+            # them. This results in the model's input and output tensors to be
+            # the same, which will cause failure for certain output tensor
+            # optimizations (e.g., pipeline output deallocation). To remedy
+            # this, we assign a 'no-op' layer on these ranks, which will
+            # disconnect the input tensor from the output tensor.
+            self.num_layers = 1
+            self.layers = torch.nn.ModuleList([ NoopTransformerLayer(1) ])
+        else:
+            self.layers = torch.nn.ModuleList(
+                [build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
-        if self.post_process:
+        if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
             self.final_layernorm = LayerNorm(
                 args.hidden_size,
@@ -741,8 +877,8 @@ class ParallelTransformer(MegatronModule):
         if self.post_process:
             # Reverting data format change [s b h] --> [b s h].
             hidden_states = hidden_states.transpose(0, 1).contiguous()
-            output = self.final_layernorm(hidden_states)
+            output = self.final_layernorm(hidden_states) if self.post_layer_norm else hidden_states
         else:
             output = hidden_states
-        
+
         return output
